@@ -338,14 +338,23 @@ impl Parser {
                     };
                 }
                 Token::LAngle => {
-                    // Peek ahead to see if it's a subset `<ttm>` or a less-than `< 300`
-                    let is_subset = self.pos + 2 < self.tokens.len() 
-                    && matches!(self.tokens[self.pos + 1].token, Token::Ident(_))
-                    && matches!(self.tokens[self.pos + 2].token, Token::RAngle);
-
-                    if is_subset {
+                    // Peek ahead to see if it's a subset `<ttm>` / `<CS.PA>`
+                    // or a less-than `< 300`. Tickers with an exchange
+                    // suffix (e.g. `CS.PA` for AXA on Euronext Paris,
+                    // `600519.SS` for a Shanghai listing) lex as a DOTTED
+                    // CHAIN of identifiers (`Ident Dot Ident ...`), not one
+                    // token -- `.` is its own `Token::Dot` -- so the
+                    // lookahead has to walk the whole chain, not just peek
+                    // one identifier ahead.
+                    if self.peek_is_subset_name() {
                         self.advance(); // consume '<'
-                        let name = self.expect_ident()?;
+                        let mut name = self.expect_ident()?;
+                        while self.current().token == Token::Dot {
+                            self.advance(); // consume '.'
+                            let part = self.expect_ident()?;
+                            name.push('.');
+                            name.push_str(&part);
+                        }
                         self.expect(&Token::RAngle)?;
                         expr = Expr::Subset {
                             base: Box::new(expr),
@@ -360,6 +369,32 @@ impl Parser {
             }
         }
         Ok(expr)
+    }
+
+    /// Looks ahead from the current `<` (not yet consumed) to decide
+    /// whether this is a subset access -- `<ttm>`, or a dotted chain like
+    /// `<CS.PA>` / `<600519.SS>` -- as opposed to a `<` used as the
+    /// less-than operator. Matches `IDENT ('.' IDENT)* '>'` immediately
+    /// after the `<`, without consuming anything.
+    fn peek_is_subset_name(&self) -> bool {
+        let mut i = self.pos + 1;
+        match self.tokens.get(i).map(|t| &t.token) {
+            Some(Token::Ident(_)) => i += 1,
+            _ => return false,
+        }
+        loop {
+            match self.tokens.get(i).map(|t| &t.token) {
+                Some(Token::RAngle) => return true,
+                Some(Token::Dot) => {
+                    i += 1;
+                    match self.tokens.get(i).map(|t| &t.token) {
+                        Some(Token::Ident(_)) => i += 1,
+                        _ => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
