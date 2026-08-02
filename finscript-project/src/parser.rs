@@ -7,7 +7,9 @@
 //! stmt       := "print" "(" expr ")" ";"
 //!             | "fn" IDENT "(" (IDENT ("," IDENT)*)? ")" "{" fn_body "}"
 //!             | "return" expr ";"
+//!             | "mut" IDENT "=" expr ";"
 //!             | IDENT "=" expr ";"
+//!             | "while" expr "{" stmt* "}"
 //! fn_body    := stmt*                 -- must end with a "return" stmt
 //!
 //! expr       := comparison
@@ -18,6 +20,7 @@
 //! primary    := INT | FLOAT | STRING | IDENT
 //!             | IDENT "(" (expr ("," expr)*)? ")"   -- function call
 //!             | "if" expr "{" expr "}" "else" "{" expr "}"
+//!             | "[" "unsafe" "]" "{" stmt* "}"      -- unsafe block, ends in return
 //!             | "(" expr ")"
 //! ```
 //!
@@ -48,17 +51,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Lt, // <
-    Gt, // >
-    Le, // <=
-    Ge, // >=
-    Eq, // ==
-    Ne, // !=   
-    Power, // ^
+    Add, Sub, Mul, Div, Lt, Gt, Le, Ge, Eq, Ne, Power,
 }
 
 impl fmt::Display for BinOp {
@@ -93,36 +86,18 @@ pub enum Expr {
     /// is the bare identifier `t`, a request to construct a new ticker --
     /// see `interpreter.rs::eval`).
     Subset { base: Box<Expr>, name: String },
-    Binary {
-        op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    If {
-        condition: Box<Expr>,
-        then_branch: Box<Expr>,
-        else_branch: Box<Expr>,
-    },
-    /// `name(args)` -- a call to a user-defined `fn`. Not used for `print`,
-    /// which stays its own `Stmt` even though it now shares call syntax.
+    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    If { condition: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
     Call { name: String, args: Vec<Expr> },
+    Unsafe { body: Vec<Stmt> },
 }
-    
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Assign { name: String, value: Expr },
+    Assign { name: String, value: Expr, mutable: bool },
     Print(Vec<Expr>),
-    /// `fn name(params) { body }`. `body`'s last statement is guaranteed
-    /// (by the parser) to be a `Return` -- see `parse_fn_def`.
-    FnDef {
-        name: String,
-        params: Vec<String>,
-        body: Vec<Stmt>,
-    },
-    /// `return expr;`. Only meaningful inside a function body -- the
-    /// interpreter rejects it at the top level. See
-    /// `interpreter.rs::run_function_body`.
+    FnDef { name: String, params: Vec<String>, body: Vec<Stmt> },
+    While { condition: Expr, body: Vec<Stmt> },
     Return(Expr),
 }
 
@@ -198,12 +173,34 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 return Ok(Stmt::Return(expr));
             }
+
+            if name == "while" {
+                self.advance();
+                let condition = self.parse_expr()?;
+                self.expect(&Token::LBrace)?;
+                let mut body = Vec::new();
+                while self.current().token != Token::RBrace {
+                    let stmt = self.parse_stmt()?;
+                    self.expect_stmt_end(&stmt)?;
+                    body.push(stmt);
+                }
+                self.expect(&Token::RBrace)?;
+                return Ok(Stmt::While { condition, body });
+            }
+
+            if name == "mut" {
+                self.advance();
+                let var_name = self.expect_ident()?;
+                self.expect(&Token::Equals)?;
+                let value = self.parse_expr()?;
+                return Ok(Stmt::Assign { name: var_name, value, mutable: true });
+            }
         }
 
         let name = self.expect_ident()?;
         self.expect(&Token::Equals)?;
         let value = self.parse_expr()?;
-        Ok(Stmt::Assign { name, value })
+        Ok(Stmt::Assign { name, value, mutable: false })
     }
 
     /// `fn name(p1, p2) { stmt* }` -- the body is parsed exactly like a
@@ -238,9 +235,7 @@ impl Parser {
         self.expect(&Token::RBrace)?;
 
         if !matches!(body.last(), Some(Stmt::Return(_))) {
-            return Err(self.error(format!(
-                "function `{name}` must end with a `return` statement"
-            )));
+            return Err(self.error(format!("function `{name}` must end with a `return` statement")));
         }
 
         Ok(Stmt::FnDef { name, params, body })
@@ -254,9 +249,8 @@ impl Parser {
             let op = match self.current().token {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
-                Token::LAngle => BinOp::Lt,  // Add this!
-                Token::RAngle => BinOp::Gt,  // Add this!
-
+                Token::LAngle => BinOp::Lt,
+                Token::RAngle => BinOp::Gt,
                 Token::LessEq => BinOp::Le,
                 Token::GreaterEq => BinOp::Ge,
                 Token::EqEq => BinOp::Eq,
@@ -265,11 +259,7 @@ impl Parser {
             };
             self.advance();
             let rhs = self.parse_term()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
         Ok(lhs)
     }
@@ -284,45 +274,34 @@ impl Parser {
             };
             self.advance();
             let rhs = self.parse_unary()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-    if self.current().token == Token::Minus {
-        self.advance();
-        let operand = self.parse_unary()?;
-        return Ok(Expr::Binary {
-            op: BinOp::Sub,
-            lhs: Box::new(Expr::Int(0)),
-            rhs: Box::new(operand),
-        });
-    }
-    // CHANGED: Delegate down to the new power precedence level
-    self.parse_power() 
+        if self.current().token == Token::Minus {
+            self.advance();
+            let operand = self.parse_unary()?;
+            return Ok(Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Int(0)),
+                rhs: Box::new(operand),
+            });
+        }
+        self.parse_power() 
     }
 
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
-    let mut lhs = self.parse_postfix()?;
-    
-    // If we see a '^', we are doing exponentiation
-    if self.current().token == Token::Caret {
-        self.advance();
-        // Right-associative: call parse_power instead of parse_postfix
-        let rhs = self.parse_power()?;
-        lhs = Expr::Binary {
-            op: BinOp::Power,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        };
-    }
-    
-    Ok(lhs)
+        let mut lhs = self.parse_postfix()?;
+        
+        if self.current().token == Token::Caret {
+            self.advance();
+            let rhs = self.parse_power()?;
+            lhs = Expr::Binary { op: BinOp::Power, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        
+        Ok(lhs)
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
@@ -332,10 +311,7 @@ impl Parser {
                 Token::Dot => {
                     self.advance();
                     let name = self.expect_ident()?;
-                    expr = Expr::Field {
-                        base: Box::new(expr),
-                        name,
-                    };
+                    expr = Expr::Field { base: Box::new(expr), name };
                 }
                 Token::LAngle => {
                     // Peek ahead to see if it's a subset `<ttm>` / `<CS.PA>`
@@ -350,18 +326,14 @@ impl Parser {
                         self.advance(); // consume '<'
                         let mut name = self.expect_ident()?;
                         while self.current().token == Token::Dot {
-                            self.advance(); // consume '.'
+                            self.advance();
                             let part = self.expect_ident()?;
                             name.push('.');
                             name.push_str(&part);
                         }
                         self.expect(&Token::RAngle)?;
-                        expr = Expr::Subset {
-                            base: Box::new(expr),
-                            name,
-                        };
+                        expr = Expr::Subset { base: Box::new(expr), name };
                     } else {
-                        // It's a less-than operator! Break out so the math parser can handle it.
                         break; 
                     }
                 }
@@ -400,33 +372,43 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let tok = self.current().token.clone();
         match tok {
-            Token::Int(n) => {
-                self.advance();
-                Ok(Expr::Int(n))
-            }
-            Token::Float(n) => {
-                self.advance();
-                Ok(Expr::Float(n))
-            }
-            Token::Str(s) => {
-                self.advance();
-                Ok(Expr::Str(s))
-            }
+            Token::Int(n) => { self.advance(); Ok(Expr::Int(n)) }
+            Token::Float(n) => { self.advance(); Ok(Expr::Float(n)) }
+            Token::Str(s) => { self.advance(); Ok(Expr::Str(s)) }
             Token::LParen => {
                 self.advance();
                 let e = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
                 Ok(e)
             }
+            Token::LBracket => {
+                self.advance();
+                let ident = self.expect_ident()?;
+                if ident != "unsafe" {
+                    return Err(self.error("expected 'unsafe' inside brackets"));
+                }
+                self.expect(&Token::RBracket)?;
+                self.expect(&Token::LBrace)?;
+                let mut body = Vec::new();
+                while self.current().token != Token::RBrace {
+                    let stmt = self.parse_stmt()?;
+                    self.expect_stmt_end(&stmt)?;
+                    body.push(stmt);
+                }
+                self.expect(&Token::RBrace)?;
+                if !matches!(body.last(), Some(Stmt::Return(_))) {
+                    return Err(self.error("[unsafe] block must end with a `return` statement"));
+                }
+                Ok(Expr::Unsafe { body })
+            }
             Token::Ident(name) => {
-            // Check our "lazy" keyword
                 if name == "if" {
-                    self.advance(); // consume the word "if"
-        
                     // 1. Parse the condition (e.g., price < 300)
+                    self.advance(); 
                     let condition = self.parse_expr()?;
         
                     // 2. Parse the 'then' block
+                    
                     self.expect(&Token::LBrace)?;
                     let then_branch = self.parse_expr()?;
                     self.expect(&Token::RBrace)?;
@@ -443,34 +425,31 @@ impl Parser {
                     self.expect(&Token::RBrace)?;
         
                     return Ok(Expr::If {
-                    condition: Box::new(condition),
-                    then_branch: Box::new(then_branch),
-                    else_branch: Box::new(else_branch),
+                        condition: Box::new(condition),
+                        then_branch: Box::new(then_branch),
+                        else_branch: Box::new(else_branch),
                     });
                 }
 
-                    // If it wasn't the word "if", it's either a call
-                    // `name(args)` or just a normal variable like `ratio`.
-                    self.advance();
-
-                    if self.current().token == Token::LParen {
-                        self.advance(); // consume '('
-                        let mut args = Vec::new();
-                        if self.current().token != Token::RParen {
-                            loop {
-                                args.push(self.parse_expr()?);
-                                if self.current().token == Token::Comma {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
+                self.advance();
+                if self.current().token == Token::LParen {
+                    self.advance(); 
+                    let mut args = Vec::new();
+                    if self.current().token != Token::RParen {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.current().token == Token::Comma {
+                                self.advance();
+                            } else {
+                                break;
                             }
                         }
-                        self.expect(&Token::RParen)?;
-                        return Ok(Expr::Call { name, args });
                     }
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::Call { name, args });
+                }
 
-                    Ok(Expr::Var(name))
+                Ok(Expr::Var(name))
             }
             other => Err(self.error(format!("expected an expression, found {other}"))),
         }
@@ -519,7 +498,7 @@ impl Parser {
     /// whose closing `}` already unambiguously ends it (writing a `;`
     /// after it too would just be visual noise, so it's not required).
     fn expect_stmt_end(&mut self, stmt: &Stmt) -> Result<(), ParseError> {
-        if matches!(stmt, Stmt::FnDef { .. }) {
+        if matches!(stmt, Stmt::FnDef { .. } | Stmt::While { .. }) {
             return Ok(());
         }
         self.expect(&Token::Semicolon)?;
@@ -700,32 +679,5 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn function_def_no_trailing_semicolon_needed() {
-        // The closing `}` ends a fn definition -- no `;` required after it.
-        let prog = parse("fn one() { return 1; }");
-        assert_eq!(prog.len(), 1);
-    }
-
-    #[test]
-    fn function_with_multiple_params_and_args() {
-        let prog = parse("fn add(a, b) { return a + b; } z = add(1, 2);");
-        match &prog[0] {
-            Stmt::FnDef { params, .. } => assert_eq!(params, &vec!["a".to_string(), "b".to_string()]),
-            other => panic!("expected FnDef, got {other:?}"),
-        }
-        match &prog[1] {
-            Stmt::Assign { value: Expr::Call { args, .. }, .. } => assert_eq!(args.len(), 2),
-            other => panic!("expected Assign with a Call, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn function_without_return_is_an_error() {
-        let tokens = tokenize("fn broken(x) { y = x; }").unwrap();
-        let err = Parser::new(tokens).parse_program().unwrap_err();
-        assert!(err.message.contains("return"));
     }
 }

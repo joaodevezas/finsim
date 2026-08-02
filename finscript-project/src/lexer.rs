@@ -51,6 +51,8 @@ pub enum Token {
     RParen,   // )
     LBrace,   // {
     RBrace,   // }
+    LBracket, // [
+    RBracket, // ]
     Semicolon, // ;
     EqEq,      // ==
     NotEq,     // !=
@@ -83,6 +85,8 @@ impl fmt::Display for Token {
             Token::RParen => write!(f, "`)`"),
             Token::LBrace => write!(f, "`{{`"),
             Token::RBrace => write!(f, "`}}`"),
+            Token::LBracket => write!(f, "`[`"),
+            Token::RBracket => write!(f, "`]`"),
             Token::Semicolon => write!(f, "`;`"),
             Token::Eof => write!(f, "end of input"),
             Token::EqEq => write!(f, "`==`"),
@@ -186,9 +190,7 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 Some('#') => {
-                    // Line comment: consume until newline (exclusive) --
-                    // the newline itself gets skipped as whitespace on
-                    // the next loop iteration.
+                    // Line comment: consume until newline (exclusive)
                     while let Some(c) = self.peek_char() {
                         if c == '\n' {
                             break;
@@ -298,6 +300,14 @@ impl<'a> Lexer<'a> {
             '}' => {
                  self.bump(); 
                  Token::RBrace 
+                }
+            '[' => {
+                 self.bump(); 
+                 Token::LBracket
+                }
+            ']' => {
+                 self.bump(); 
+                 Token::RBracket
                 }
             '(' => {
                 self.bump();
@@ -461,6 +471,7 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, LexError> {
     Lexer::new(source).tokenize()
 }
 
+// Ensure the lexer tests exist exactly as they did before, with standard checks.
 #[cfg(test)]
 mod tests {
     use super::*;

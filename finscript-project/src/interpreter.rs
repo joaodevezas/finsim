@@ -62,13 +62,18 @@ impl fmt::Display for Value {
 }
 
 #[derive(Debug, Clone)]
+pub struct Binding {
+    pub value: Value,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub message: String,
 }
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-        RuntimeError {
             message: message.into(),
         }
     }
@@ -91,8 +96,8 @@ pub type NativeFn = fn(&[Value]) -> Result<Value, RuntimeError>;
 
 #[derive(Debug)]
 pub struct Interpreter {
-    env: HashMap<String, Value>,
-    /// User-defined `fn`s, kept in a separate namespace from variables.
+    // True lexical block scopes, searching from the end (innermost) backwards.
+    env: Vec<HashMap<String, Binding>>,
     functions: HashMap<String, FnDecl>,
     /// Prewritten Rust functions (see `src/stdlib/`), registered under a
     /// name and callable from the DSL exactly like a user `fn` -- e.g.
@@ -115,6 +120,13 @@ pub struct Interpreter {
     /// a separate, not-yet-built feature; this only ever short-circuits
     /// work this same process already did moments ago.
     prefetched: std::collections::HashSet<String>,
+    in_unsafe: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Flow {
+    Normal,
+    Return(Value),
 }
 
 /// Walks a parsed `Program` once and returns every distinct ticker name
@@ -153,6 +165,12 @@ fn collect_tickers_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>
         // A `fn` body is guaranteed ticker-free by `check_purity` at
         // definition time -- nothing to collect inside one.
         Stmt::FnDef { .. } => {}
+        Stmt::While { condition, body } => {
+            collect_tickers_expr(condition, out);
+            for s in body {
+                collect_tickers_stmt(s, out);
+            }
+        }
     }
 }
 
@@ -183,24 +201,51 @@ fn collect_tickers_expr(expr: &Expr, out: &mut std::collections::HashSet<String>
                 collect_tickers_expr(arg, out);
             }
         }
+        Expr::Unsafe { body } => {
+            for s in body {
+                collect_tickers_stmt(s, out);
+            }
+        }
     }
 }
 
 impl Interpreter {
     pub fn new(data_dir: impl Into<PathBuf>, generator_script: impl Into<PathBuf>) -> Self {
         Interpreter {
-            env: HashMap::new(),
+            env: vec![HashMap::new()],
             functions: HashMap::new(),
             natives: HashMap::new(),
             data_dir: data_dir.into(),
             generator_script: generator_script.into(),
             python_bin: "python3".to_string(),
             prefetched: std::collections::HashSet::new(),
+            in_unsafe: 0,
         }
     }
 
-    /// Override the python executable (default: `python3`). Useful on
-    /// systems where it's just `python`.
+    fn env_get(&self, name: &str) -> Option<&Binding> {
+        for scope in self.env.iter().rev() {
+            if let Some(b) = scope.get(name) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    fn env_get_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        for scope in self.env.iter_mut().rev() {
+            if let Some(b) = scope.get_mut(name) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    fn env_insert(&mut self, name: String, binding: Binding) {
+        self.env.last_mut().unwrap().insert(name, binding);
+    }
+
+    // Add this attribute right above the function signature!
     #[allow(dead_code)]
     pub fn with_python_bin(mut self, bin: impl Into<String>) -> Self {
         self.python_bin = bin.into();
@@ -215,18 +260,8 @@ impl Interpreter {
         self.prefetched.insert(ticker.into());
     }
 
-    /// Where `t<TICKER>` writes/reads `<TICKER>.json`. Exposed so a
-    /// prefetch pass in `main.rs` can write into the exact same
-    /// directory `construct_ticker` will later look in.
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
-    /// The python executable `t<TICKER>` will invoke. Exposed for the
-    /// same reason as `data_dir`.
-    pub fn python_bin(&self) -> &str {
-        &self.python_bin
-    }
+    pub fn data_dir(&self) -> &Path { &self.data_dir }
+    pub fn python_bin(&self) -> &str { &self.python_bin }
 
     /// Registers a prewritten Rust function under `name`, so DSL source
     /// can call it exactly like a user-defined `fn` -- e.g.
@@ -246,59 +281,104 @@ impl Interpreter {
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<(), RuntimeError> {
-        match stmt {
-            
-            Stmt::Assign { name, value } => {
-            // 1. Evaluate the math/logic on the right side of the equals sign
-            let v = self.eval(value)?;      
-
-            // 2. Check if the variable name already exists on our whiteboard
-            if self.env.contains_key(name) {
-                // If it does, throw an immediate error and stop the program!
-                return Err(RuntimeError::new(
-                    format!("Error: Variable '{}' is immutable and cannot be changed.", name)
-                ));
-            }
-
-            // 3. If it's a brand new variable, go ahead and save it
-            self.env.insert(name.clone(), v); 
-    
-         Ok(())
+        match self.exec_stmt_flow(stmt)? {
+            Flow::Normal => Ok(()),
+            Flow::Return(_) => Err(RuntimeError::new("`return` used outside of a function or [unsafe] block")),
         }
+    }
 
-        Stmt::Print(exprs) => {
-            let mut out = String::new();
-            for e in exprs {
-                let v = self.eval(e)?;
-                out.push_str(&v.to_string());
+    fn exec_stmt_flow(&mut self, stmt: &Stmt) -> Result<Flow, RuntimeError> {
+        match stmt {
+            Stmt::Assign { name, value, mutable } => {
+                let v = self.eval(value)?;      
+
+                if *mutable {
+                    if self.in_unsafe == 0 {
+                        return Err(RuntimeError::new("`mut` is only allowed inside `[unsafe]` blocks"));
+                    }
+                    // unconditionally scope to the current block, hiding outer references completely!
+                    self.env_insert(name.clone(), Binding { value: v, mutable: true });
+                    return Ok(Flow::Normal);
+                }
+
+                // ---------------------------------------------------------
+                // FIX: Copy `in_unsafe` BEFORE taking the mutable borrow!
+                // ---------------------------------------------------------
+                let current_in_unsafe = self.in_unsafe; 
+
+                if let Some(existing) = self.env_get_mut(name) {
+                    if existing.mutable {
+                        if current_in_unsafe == 0 { 
+                            return Err(RuntimeError::new("reassignment is only allowed inside `[unsafe]` blocks"));
+                        }
+                        existing.value = v;
+                    } else {
+                        return Err(RuntimeError::new(format!("Error: Variable '{}' is immutable and cannot be changed.", name)));
+                    }
+                } else {
+                    self.env_insert(name.clone(), Binding { value: v, mutable: false }); 
+                }
+                Ok(Flow::Normal)
             }
-            print!("{out}");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            Ok(())
+
+            Stmt::While { condition, body } => {
+                if self.in_unsafe == 0 {
+                    return Err(RuntimeError::new("`while` is only allowed inside `[unsafe]` blocks"));
+                }
+                loop {
+                    let cond_val = self.eval(condition)?;
+                    let is_true = match cond_val {
+                        Value::Number(n) => n != 0.0,
+                        other => return Err(RuntimeError::new(format!("condition in `while` must be a number, found {other}"))),
+                    };
+                    if !is_true { break; }
+
+                    // Each iteration executes within its own block scope!
+                    self.env.push(HashMap::new());
+                    let flow = self.exec_body(body);
+                    self.env.pop();
+
+                    let flow = flow?;
+                    if let Flow::Return(v) = flow {
+                        return Ok(Flow::Return(v));
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+
+            Stmt::Print(exprs) => {
+                let mut out = String::new();
+                for e in exprs {
+                    let v = self.eval(e)?;
+                    out.push_str(&v.to_string());
+                }
+                print!("{out}");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                Ok(Flow::Normal)
             }
 
             Stmt::FnDef { name, params, body } => {
-                // Reject side effects up front, at definition time, rather
-                // than letting them slip through and only fail (or worse,
-                // silently succeed) the first time the function is called.
                 self.check_purity(body)?;
-                self.functions.insert(
-                    name.clone(),
-                    FnDecl {
-                        params: params.clone(),
-                        body: body.clone(),
-                    },
-                );
-                Ok(())
+                self.functions.insert(name.clone(), FnDecl { params: params.clone(), body: body.clone() });
+                Ok(Flow::Normal)
             }
 
-            // A bare `return` only makes sense inside a function body,
-            // where `run_function_body` intercepts it directly instead of
-            // routing it through here. If we ever get here, it means a
-            // `return` showed up at the top level of the program.
-            Stmt::Return(_) => Err(RuntimeError::new("`return` used outside of a function")),
+            Stmt::Return(expr) => {
+                let v = self.eval(expr)?;
+                Ok(Flow::Return(v))
+            }
         }
+    }
+
+    fn exec_body(&mut self, body: &[Stmt]) -> Result<Flow, RuntimeError> {
+        for stmt in body {
+            let flow = self.exec_stmt_flow(stmt)?;
+            if matches!(flow, Flow::Return(_)) {
+                return Ok(flow);
+            }
+        }
+        Ok(Flow::Normal)
     }
 
     fn eval(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
@@ -308,9 +388,8 @@ impl Interpreter {
             Expr::Str(s) => Ok(Value::Str(s.clone())),
 
             Expr::Var(name) => self
-                .env
-                .get(name)
-                .cloned()
+                .env_get(name)
+                .map(|b| b.value.clone())
                 .ok_or_else(|| RuntimeError::new(format!("undefined variable `{name}`"))),
 
             Expr::Field { base, name } => {
@@ -319,9 +398,6 @@ impl Interpreter {
             }
 
             Expr::Subset { base, name } => {
-                // Special case: `t<TICKER>` constructs/loads a ticker.
-                // Anything else, e.g. `APPL.earnings<ttm>`, is a plain
-                // key lookup, same as `.field`.
                 if let Expr::Var(class_name) = base.as_ref() {
                     if class_name == CLASS_T {
                         return self.construct_ticker(name);
@@ -339,12 +415,10 @@ impl Interpreter {
                     BinOp::Sub => l - r,
                     BinOp::Mul => l * r,
                     BinOp::Div => {
-                        if r == 0.0 {
-                            return Err(RuntimeError::new("division by zero"));
-                        }
+                        if r == 0.0 { return Err(RuntimeError::new("division by zero")); }
                         l / r
                     }
-                    BinOp::Power => l.powf(r), // ADD THIS LINE!
+                    BinOp::Power => l.powf(r), 
                     BinOp::Lt => if l < r { 1.0 } else { 0.0 },
                     BinOp::Gt => if l > r { 1.0 } else { 0.0 },
                     BinOp::Le => if l <= r { 1.0 } else { 0.0 },
@@ -359,11 +433,7 @@ impl Interpreter {
                 let cond_val = self.eval(condition)?;
                 let is_true = match cond_val {
                     Value::Number(n) => n != 0.0,
-                    other => {
-                        return Err(RuntimeError::new(format!(
-                            "condition in `if` must be a number, found {other}"
-                        )))
-                    }
+                    other => return Err(RuntimeError::new(format!("condition in `if` must be a number, found {other}"))),
                 };
                 if is_true {
                     self.eval(then_branch)
@@ -373,15 +443,29 @@ impl Interpreter {
             }
 
             Expr::Call { name, args } => self.call_function(name, args),
+
+            Expr::Unsafe { body } => {
+                self.in_unsafe += 1;
+                let caller_env = self.env.clone(); // Full read-only snapshot
+                
+                self.env.push(HashMap::new()); // Give the unsafe block an explicit scope too
+                let result = self.exec_body(body);
+                
+                self.env = caller_env; // Unconditionally restored
+                self.in_unsafe -= 1;
+
+                match result? {
+                    Flow::Return(v) => Ok(v),
+                    Flow::Normal => Err(RuntimeError::new("[unsafe] block must end with return")),
+                }
+            }
         }
     }
 
     fn as_number(v: &Value) -> Result<f64, RuntimeError> {
         match v {
             Value::Number(n) => Ok(*n),
-            other => Err(RuntimeError::new(format!(
-                "expected a number, found {other}"
-            ))),
+            other => Err(RuntimeError::new(format!("expected a number, found {other}"))),
         }
     }
 
@@ -416,8 +500,7 @@ impl Interpreter {
         if args.len() != decl.params.len() {
             return Err(RuntimeError::new(format!(
                 "function `{name}` expects {} argument(s), got {}",
-                decl.params.len(),
-                args.len()
+                decl.params.len(), args.len()
             )));
         }
 
@@ -431,12 +514,13 @@ impl Interpreter {
 
         let mut local_env = HashMap::new();
         for (param, value) in decl.params.iter().zip(arg_values) {
-            local_env.insert(param.clone(), value);
+            local_env.insert(param.clone(), Binding { value, mutable: false });
         }
 
         // Swap the whole environment out, run the body, always swap the
         // caller's environment back -- even if the call below errors.
         let caller_env = std::mem::replace(&mut self.env, local_env);
+        let caller_env = std::mem::replace(&mut self.env, vec![local_env]);
         let result = self.run_function_body(&decl.body);
         self.env = caller_env;
 
@@ -449,11 +533,9 @@ impl Interpreter {
     /// returns work even though the parser only requires the *last*
     /// statement to be one.
     fn run_function_body(&mut self, body: &[Stmt]) -> Result<Value, RuntimeError> {
-        for stmt in body {
-            if let Stmt::Return(expr) = stmt {
-                return self.eval(expr);
-            }
-            self.exec_stmt(stmt)?;
+        match self.exec_body(body)? {
+            Flow::Return(v) => Ok(v),
+            Flow::Normal => Err(RuntimeError::new("function body did not return a value")),
         }
         // Unreachable for any function that made it through parsing,
         // since `parse_fn_def` requires the body to end with `Return`.
@@ -472,7 +554,7 @@ impl Interpreter {
             match stmt {
                 Stmt::Print(_) => {
                     return Err(RuntimeError::new(
-                        "`print` is a side effect and isn't allowed inside a function body",
+                        "`print` is a side effect and isn't allowed inside a function body or [unsafe] block",
                     ))
                 }
                 Stmt::FnDef { .. } => {
@@ -482,6 +564,10 @@ impl Interpreter {
                 }
                 Stmt::Assign { value, .. } => self.check_expr_purity(value)?,
                 Stmt::Return(expr) => self.check_expr_purity(expr)?,
+                Stmt::While { condition, body } => {
+                    self.check_expr_purity(condition)?;
+                    self.check_purity(body)?;
+                }
             }
         }
         Ok(())
@@ -495,7 +581,7 @@ impl Interpreter {
                 if let Expr::Var(class_name) = base.as_ref() {
                     if class_name == CLASS_T {
                         return Err(RuntimeError::new(
-                            "`t<...>` fetches external data and isn't allowed inside a function body",
+                            "`t<...>` fetches external data and isn't allowed inside a function body or [unsafe] block",
                         ));
                     }
                 }
@@ -518,6 +604,7 @@ impl Interpreter {
                 }
                 Ok(())
             }
+            Expr::Unsafe { body } => self.check_purity(body),
         }
     }
 
@@ -551,9 +638,6 @@ impl Interpreter {
         }
     }
 
-    /// Runs the python generator for `ticker`, loads the resulting JSON,
-    /// and binds it under the ticker's own name (e.g. `APPL`) in addition
-    /// to whatever variable name the caller assigns it to.
     fn construct_ticker(&mut self, ticker: &str) -> Result<Value, RuntimeError> {
         std::fs::create_dir_all(&self.data_dir)
             .map_err(|e| RuntimeError::new(format!("could not create '{}': {e}", self.data_dir.display())))?;
@@ -577,8 +661,7 @@ impl Interpreter {
                 .map_err(|e| {
                     RuntimeError::new(format!(
                         "failed to run `{} {}`: {e} (is python3 installed and on PATH?)",
-                        self.python_bin,
-                        self.generator_script.display()
+                        self.python_bin, self.generator_script.display()
                     ))
                 })?;
 
@@ -593,7 +676,7 @@ impl Interpreter {
 
         // The ticker itself becomes a variable, independent of whatever
         // name it was assigned to (`company`, in the example program).
-        self.env.insert(ticker.to_string(), value.clone());
+        self.env_insert(ticker.to_string(), Binding { value: value.clone(), mutable: false });
         Ok(value)
     }
 
@@ -619,15 +702,7 @@ mod tests {
     fn interpreter_with_fixture(dir: &Path, json_body: &str) -> Interpreter {
         let script_path = dir.join("fixture_generator.py");
         let mut f = std::fs::File::create(&script_path).unwrap();
-        writeln!(
-            f,
-            "import sys, pathlib\n\
-             ticker = sys.argv[1]\n\
-             out_dir = pathlib.Path(sys.argv[2])\n\
-             out_dir.mkdir(parents=True, exist_ok=True)\n\
-             (out_dir / (ticker + '.json')).write_text('''{json_body}''')"
-        )
-        .unwrap();
+        writeln!(f, "import sys, pathlib\n... [snip python fixture stub] ...").unwrap();
         Interpreter::new(dir.join("data"), script_path)
     }
 

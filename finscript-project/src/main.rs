@@ -118,14 +118,12 @@ fn prefetch_tickers(
     python_bin: &str,
 ) -> Vec<String> {
     if let Err(e) = std::fs::create_dir_all(data_dir) {
-        eprintln!("warning: could not create '{}': {e} (prefetch skipped, will fetch during run instead)", data_dir.display());
+        eprintln!("warning: could not create '{}': {e} (prefetch skipped)", data_dir.display());
         return Vec::new();
     }
 
-    let (tx, rx) = mpsc::channel::<String>(); // work queue: ticker names to fetch
-    for ticker in tickers {
-        tx.send(ticker.clone()).ok();
-    }
+    let (tx, rx) = mpsc::channel::<String>();
+    for ticker in tickers { tx.send(ticker.clone()).ok(); }
     drop(tx);
 
     // A handful of worker threads pull from the same queue until it's
@@ -155,12 +153,8 @@ fn prefetch_tickers(
 
                     match status {
                         Ok(s) if s.success() => succeeded.push(ticker),
-                        Ok(s) => eprintln!(
-                            "warning: prefetch of `{ticker}` exited with {s}, will retry during run"
-                        ),
-                        Err(e) => eprintln!(
-                            "warning: could not prefetch `{ticker}`: {e}, will retry during run"
-                        ),
+                        Ok(s) => eprintln!("warning: prefetch of `{ticker}` exited with {s}"),
+                        Err(e) => eprintln!("warning: could not prefetch `{ticker}`: {e}"),
                     }
                 }
                 succeeded
@@ -179,29 +173,19 @@ fn prefetch_tickers(
 fn find_generator_script() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("FIN_GENERATOR_SCRIPT") {
         let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
+        if p.is_file() { return Some(p); }
     }
 
     let cwd_candidate = PathBuf::from("scripts/generate_data.py");
-    if cwd_candidate.is_file() {
-        return Some(cwd_candidate);
-    }
+    if cwd_candidate.is_file() { return Some(cwd_candidate); }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            // target/debug/fin -> ../../scripts/generate_data.py
             let from_target = exe_dir.join("../../scripts/generate_data.py");
-            if from_target.is_file() {
-                return Some(from_target);
-            }
+            if from_target.is_file() { return Some(from_target); }
             let alongside = exe_dir.join("scripts/generate_data.py");
-            if alongside.is_file() {
-                return Some(alongside);
-            }
+            if alongside.is_file() { return Some(alongside); }
         }
     }
-
     None
 }
