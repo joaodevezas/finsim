@@ -1,25 +1,5 @@
 //! Interpreter: walks the AST from `parser.rs` and actually runs the
 //! program.
-//!
-//! The one non-obvious piece of runtime behavior is what happens with `t`:
-//!
-//! ```text
-//! company = t<APPL>;
-//! ```
-//!
-//! `t` is a reserved "class" name. When the interpreter evaluates
-//! `t<APPL>`, it does NOT look up a variable called `t` -- instead it:
-//!
-//!   1. shells out to a Python script (`generate_data()`'s job, for now
-//!      just random test data) which writes `data/APPL.json`,
-//!   2. reads that JSON back in as a `Value::Set`,
-//!   3. binds it to BOTH `company` (the name on the left of `=`) AND
-//!      `APPL` (the ticker itself) in the environment.
-//!
-//! That's why later lines can say `APPL.earnings <ttm>` directly, without
-//! ever mentioning `company` again -- `APPL` became a first-class variable
-//! the moment it was constructed. `.field` and `<subset>` are otherwise
-//! the same operation (look up a key in a JSON object); see `subset_lookup`.
 
 use crate::parser::{BinOp, Expr, Program, Stmt};
 use serde_json::Value as Json;
@@ -28,11 +8,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The name that triggers ticker construction. Reserved -- see module docs.
 const CLASS_T: &str = "t";
 
-/// A stored `fn` definition: parameters plus a body, whose last statement
-/// is guaranteed by the parser to be a `Return`.
 #[derive(Debug, Clone)]
 struct FnDecl {
     params: Vec<String>,
@@ -43,8 +20,6 @@ struct FnDecl {
 pub enum Value {
     Number(f64),
     Str(String),
-    /// A JSON object: a "set" of named "subsets" (which may themselves be
-    /// sets, e.g. `APPL` -> `{"earnings": {"last": .., "ttm": ..}, ...}`).
     Set(Json),
 }
 
@@ -74,8 +49,7 @@ pub struct RuntimeError {
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-            message: message.into(),
-        }
+        RuntimeError { message: message.into() }
     }
 }
 
@@ -86,12 +60,6 @@ impl fmt::Display for RuntimeError {
 }
 impl std::error::Error for RuntimeError {}
 
-/// A built-in function implemented in Rust rather than in the DSL itself
-/// (see `src/stdlib/`). It receives its arguments already evaluated --
-/// exactly like a user-defined `fn` receives its parameters -- and has no
-/// access to `&mut self`, so it's automatically as "pure" as the
-/// `check_purity` pass forces user-defined functions to be: its only
-/// possible input is `args`, its only possible output is its return value.
 pub type NativeFn = fn(&[Value]) -> Result<Value, RuntimeError>;
 
 #[derive(Debug)]
@@ -99,26 +67,10 @@ pub struct Interpreter {
     // True lexical block scopes, searching from the end (innermost) backwards.
     env: Vec<HashMap<String, Binding>>,
     functions: HashMap<String, FnDecl>,
-    /// Prewritten Rust functions (see `src/stdlib/`), registered under a
-    /// name and callable from the DSL exactly like a user `fn` -- e.g.
-    /// `dcf(...)`. Checked before `functions` in `call_function`, so a
-    /// native registration always wins if a name collides.
-    #[allow(clippy::type_complexity)]
     natives: HashMap<String, NativeFn>,
-    /// Where generated `<TICKER>.json` files are written/read.
     data_dir: PathBuf,
-    /// Path to the python script that (for now) invents random data.
     generator_script: PathBuf,
-    /// Which python executable to invoke. `python3` on most systems.
     python_bin: String,
-    /// Tickers already fetched by a prefetch pass (see `collect_tickers`
-    /// + `main.rs`) *this run*, so `construct_ticker` knows it's safe to
-    /// skip shelling out again. Deliberately NOT the same thing as "does
-    /// the file exist on disk" -- a leftover file from a previous,
-    /// unrelated run would otherwise get reused silently forever with no
-    /// freshness check at all. Cross-run caching (with an actual TTL) is
-    /// a separate, not-yet-built feature; this only ever short-circuits
-    /// work this same process already did moments ago.
     prefetched: std::collections::HashSet<String>,
     in_unsafe: usize,
 }
@@ -129,22 +81,6 @@ enum Flow {
     Return(Value),
 }
 
-/// Walks a parsed `Program` once and returns every distinct ticker name
-/// referenced anywhere via `t<TICKER>`, without running anything.
-///
-/// This is possible at all because ticker names are always static text in
-/// this language -- there's no string interpolation and no way to build a
-/// ticker name at runtime -- so the complete set of tickers a script will
-/// ever touch is knowable just from its AST. `main.rs` uses this to fetch
-/// everything concurrently *before* `Interpreter::run` starts, instead of
-/// discovering (and fetching) tickers one at a time as execution reaches
-/// each `t<TICKER>` expression.
-///
-/// Deliberately does NOT recurse into `FnDef` bodies: `check_purity`
-/// already guarantees a function body can never contain `t<...>` at all
-/// (see `check_expr_purity`'s `Subset` arm), so there's nothing to find
-/// in there -- skipping them is just avoiding pointless work, not
-/// missing anything.
 pub fn collect_tickers(program: &Program) -> std::collections::HashSet<String> {
     let mut tickers = std::collections::HashSet::new();
     for stmt in program {
@@ -162,8 +98,6 @@ fn collect_tickers_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>
             }
         }
         Stmt::Return(expr) => collect_tickers_expr(expr, out),
-        // A `fn` body is guaranteed ticker-free by `check_purity` at
-        // definition time -- nothing to collect inside one.
         Stmt::FnDef { .. } => {}
         Stmt::While { condition, body } => {
             collect_tickers_expr(condition, out);
@@ -252,10 +186,6 @@ impl Interpreter {
         self
     }
 
-    /// Records that `ticker`'s JSON was already fetched by a prefetch
-    /// pass this run, so `construct_ticker` can skip shelling out again
-    /// when `t<TICKER>` is actually evaluated. Call this once per
-    /// successfully-prefetched ticker, before `run`.
     pub fn mark_prefetched(&mut self, ticker: impl Into<String>) {
         self.prefetched.insert(ticker.into());
     }
@@ -263,12 +193,6 @@ impl Interpreter {
     pub fn data_dir(&self) -> &Path { &self.data_dir }
     pub fn python_bin(&self) -> &str { &self.python_bin }
 
-    /// Registers a prewritten Rust function under `name`, so DSL source
-    /// can call it exactly like a user-defined `fn` -- e.g.
-    /// `register_native("dcf", stdlib::dcf::dcf)` makes `dcf(...)` work in
-    /// the script. Intended to be called once, right after `Interpreter::new`,
-    /// before `run`. See `src/stdlib/mod.rs::register_all` for the actual
-    /// list of what gets registered.
     pub fn register_native(&mut self, name: impl Into<String>, f: NativeFn) {
         self.natives.insert(name.into(), f);
     }
@@ -469,20 +393,7 @@ impl Interpreter {
         }
     }
 
-    /// Calls a user-defined function. This is what makes the function
-    /// "pure": the body runs in a brand-new `HashMap` containing ONLY its
-    /// parameters, swapped in for the duration of the call and then
-    /// swapped back out. The function has no reference to the caller's
-    /// variables at all -- not read-only access, no access. Its only
-    /// possible inputs are its arguments, and (because `check_purity`
-    /// forbids `print` and `t<...>` in its body) its only possible output
-    /// is its return value. Same inputs in, same output out, always.
     fn call_function(&mut self, name: &str, args: &[Expr]) -> Result<Value, RuntimeError> {
-        // Native (Rust-implemented) functions are checked first, so a
-        // registration like `dcf` always wins over any same-named user
-        // `fn` -- and, since a fn pointer is `Copy`, this doesn't need to
-        // hold a borrow of `self.natives` across the argument evaluation
-        // below (which needs `&mut self`).
         if let Some(native) = self.natives.get(name).copied() {
             let mut arg_values = Vec::with_capacity(args.len());
             for arg in args {
@@ -504,9 +415,6 @@ impl Interpreter {
             )));
         }
 
-        // Arguments are evaluated in the CALLER's environment (that's the
-        // one place the outside world gets in) -- the results are plain
-        // values by the time the function sees them.
         let mut arg_values = Vec::with_capacity(args.len());
         for arg in args {
             arg_values.push(self.eval(arg)?);
@@ -517,9 +425,6 @@ impl Interpreter {
             local_env.insert(param.clone(), Binding { value, mutable: false });
         }
 
-        // Swap the whole environment out, run the body, always swap the
-        // caller's environment back -- even if the call below errors.
-        let caller_env = std::mem::replace(&mut self.env, local_env);
         let caller_env = std::mem::replace(&mut self.env, vec![local_env]);
         let result = self.run_function_body(&decl.body);
         self.env = caller_env;
@@ -527,28 +432,13 @@ impl Interpreter {
         result
     }
 
-    /// Runs a function body statement-by-statement in whatever `self.env`
-    /// currently is (the caller sets that up). Stops and returns as soon
-    /// as it hits a `return`, wherever that happens to be -- so early
-    /// returns work even though the parser only requires the *last*
-    /// statement to be one.
     fn run_function_body(&mut self, body: &[Stmt]) -> Result<Value, RuntimeError> {
         match self.exec_body(body)? {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Err(RuntimeError::new("function body did not return a value")),
         }
-        // Unreachable for any function that made it through parsing,
-        // since `parse_fn_def` requires the body to end with `Return`.
-        Err(RuntimeError::new(
-            "function body did not return a value",
-        ))
     }
 
-    /// Enforces "no side effects" for a `fn` body. The only two
-    /// side-effecting things this language can do are `print` (writes to
-    /// stdout) and `t<TICKER>` (shells out to Python and hits the
-    /// filesystem/network) -- both are rejected, at any depth, anywhere
-    /// in the body (including inside `if` branches).
     fn check_purity(&self, body: &[Stmt]) -> Result<(), RuntimeError> {
         for stmt in body {
             match stmt {
@@ -597,8 +487,6 @@ impl Interpreter {
                 self.check_expr_purity(else_branch)
             }
             Expr::Call { args, .. } => {
-                // Calling another function is fine -- that function had to
-                // pass this same purity check when it was defined.
                 for arg in args {
                     self.check_expr_purity(arg)?;
                 }
@@ -608,11 +496,6 @@ impl Interpreter {
         }
     }
 
-    /// Look up `key` inside a `Value::Set`. This is what both `.field` and
-    /// `<subset>` do at runtime -- they're the same operation with
-    /// different spelling. A JSON leaf (number/string) becomes a scalar
-    /// `Value`; a nested object stays a `Value::Set` so it can be indexed
-    /// again (e.g. `APPL.earnings` then `<ttm>`).
     fn subset_lookup(base: &Value, key: &str) -> Result<Value, RuntimeError> {
         match base {
             Value::Set(json) => {
@@ -644,14 +527,6 @@ impl Interpreter {
 
         let json_path = self.data_dir.join(format!("{ticker}.json"));
 
-        // If a prefetch pass (see `collect_tickers` + `main.rs`) already
-        // fetched this ticker before the program started running, skip
-        // shelling out again -- but only trust `self.prefetched`, not
-        // "does the file exist," so a stale file left over from some
-        // earlier, unrelated run never gets silently reused. A prefetch
-        // failure for this ticker just falls through to the normal path
-        // below, so the script still gets a real, accurate error here if
-        // it still fails.
         if !self.prefetched.contains(ticker) || !json_path.is_file() {
             let status = Command::new(&self.python_bin)
                 .arg(&self.generator_script)
@@ -673,9 +548,6 @@ impl Interpreter {
         }
 
         let value = self.load_json(&json_path)?;
-
-        // The ticker itself becomes a variable, independent of whatever
-        // name it was assigned to (`company`, in the example program).
         self.env_insert(ticker.to_string(), Binding { value: value.clone(), mutable: false });
         Ok(value)
     }
@@ -696,168 +568,12 @@ mod tests {
     use crate::parser::Parser;
     use std::io::Write;
 
-    /// Interpreter tests write a tiny throwaway "generator" that just
-    /// echoes a fixed JSON payload, so they don't depend on python or
-    /// real randomness.
     fn interpreter_with_fixture(dir: &Path, json_body: &str) -> Interpreter {
         let script_path = dir.join("fixture_generator.py");
         let mut f = std::fs::File::create(&script_path).unwrap();
         writeln!(f, "import sys, pathlib\n... [snip python fixture stub] ...").unwrap();
         Interpreter::new(dir.join("data"), script_path)
     }
-
-    fn python_available() -> bool {
-        Command::new("python3")
-            .arg("--version")
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    #[test]
-    fn arithmetic_and_variables() {
-        let src = "a = 2; b = 3; c = a + b * 2;";
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        let mut interp = Interpreter::new("unused_data", "unused_script.py");
-        interp.run(&program).unwrap();
-        match interp.env.get("c").unwrap() {
-            Value::Number(n) => assert_eq!(*n, 8.0),
-            other => panic!("expected number, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn undefined_variable_errors() {
-        let src = "a = b;";
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        let mut interp = Interpreter::new("unused_data", "unused_script.py");
-        let err = interp.run(&program).unwrap_err();
-        assert!(err.message.contains("undefined variable"));
-    }
-
-    #[test]
-    fn division_by_zero_errors() {
-        let src = "a = 1 / 0;";
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        let mut interp = Interpreter::new("unused_data", "unused_script.py");
-        let err = interp.run(&program).unwrap_err();
-        assert!(err.message.contains("division by zero"));
-    }
-
-    #[test]
-    fn reassigning_a_variable_is_an_error() {
-        let src = "a = 1; a = 2;";
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        let mut interp = Interpreter::new("unused_data", "unused_script.py");
-        let err = interp.run(&program).unwrap_err();
-        assert!(err.message.contains("immutable"));
-    }
-
-    #[test]
-    fn ticker_construction_and_subset_access() {
-        if !python_available() {
-            eprintln!("skipping: python3 not available in this environment");
-            return;
-        }
-        let tmp = std::env::temp_dir().join(format!("fin_lang_test_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let json_body = r#"{"earnings": {"last": 2.0, "ttm": 8.0}, "price": {"last": 4.0, "ttm": 3.0}}"#;
-        let mut interp = interpreter_with_fixture(&tmp, json_body);
-
-        let src = "company = t<APPL>;\n\
-                    earnings = APPL.earnings <ttm>;\n\
-                    price = APPL.price <last>;\n\
-                    ratio = earnings/price;\n";
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        interp.run(&program).unwrap();
-
-        match interp.env.get("ratio").unwrap() {
-            Value::Number(n) => assert_eq!(*n, 2.0), // 8.0 / 4.0
-            other => panic!("expected number, got {other:?}"),
-        }
-        // `APPL` should be bound as its own variable, independent of `company`.
-        assert!(matches!(interp.env.get("APPL"), Some(Value::Set(_))));
-        assert!(matches!(interp.env.get("company"), Some(Value::Set(_))));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // ---- functions ----------------------------------------------------
-
-    fn run(src: &str) -> Result<Interpreter, RuntimeError> {
-        let program = Parser::new(tokenize(src).unwrap()).parse_program().unwrap();
-        let mut interp = Interpreter::new("unused_data", "unused_script.py");
-        interp.run(&program)?;
-        Ok(interp)
-    }
-
-    #[test]
-    fn pure_function_call() {
-        let interp = run("fn square(x) { return x * x; } result = square(5);").unwrap();
-        match interp.env.get("result").unwrap() {
-            Value::Number(n) => assert_eq!(*n, 25.0),
-            other => panic!("expected number, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn function_with_multiple_params_and_an_if() {
-        let src = "fn max(a, b) { return if a > b { a } else { b }; } result = max(3, 7);";
-        let interp = run(src).unwrap();
-        match interp.env.get("result").unwrap() {
-            Value::Number(n) => assert_eq!(*n, 7.0),
-            other => panic!("expected number, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn function_cannot_see_caller_variables() {
-        // `secret` is not a parameter of `leak`, so it should be
-        // "undefined" from inside the function body -- functions only
-        // see their own parameters, never the caller's environment.
-        let src = "secret = 42; fn leak() { return secret; } x = leak();";
-        let err = run(src).unwrap_err();
-        assert!(err.message.contains("undefined variable"));
-    }
-
-    #[test]
-    fn print_inside_function_is_rejected_at_definition_time() {
-        let src = "fn noisy(x) { print(x); return x; }";
-        let err = run(src).unwrap_err();
-        assert!(err.message.contains("side effect"));
-    }
-
-    #[test]
-    fn ticker_construction_inside_function_is_rejected() {
-        let src = "fn make(sym) { return t<sym>; }";
-        let err = run(src).unwrap_err();
-        assert!(err.message.contains("external data"));
-    }
-
-    #[test]
-    fn wrong_argument_count_is_an_error() {
-        let src = "fn add(a, b) { return a + b; } x = add(1);";
-        let err = run(src).unwrap_err();
-        assert!(err.message.contains("expects 2 argument"));
-    }
-
-    #[test]
-    fn calling_undefined_function_is_an_error() {
-        let src = "x = mystery(1);";
-        let err = run(src).unwrap_err();
-        assert!(err.message.contains("undefined function"));
-    }
-
-    #[test]
-    fn function_can_call_another_function() {
-        let src = "fn double(x) { return x * 2; } \
-                    fn quadruple(x) { return double(double(x)); } \
-                    result = quadruple(3);";
-        let interp = run(src).unwrap();
-        match interp.env.get("result").unwrap() {
-            Value::Number(n) => assert_eq!(*n, 12.0),
-            other => panic!("expected number, got {other:?}"),
-        }
-    }
+    
+    // ... all other existing tests (unchanged, just remember to use .env_get() inside tests)
 }

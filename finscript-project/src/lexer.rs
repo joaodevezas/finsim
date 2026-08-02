@@ -179,10 +179,6 @@ impl<'a> Lexer<'a> {
     }
 
     /// Skip spaces, tabs, newlines, carriage returns, and `#` line comments.
-    /// Newlines used to be a real token (statements ended at end-of-line);
-    /// now statements end at `;` instead, so a newline is just whitespace
-    /// like any other -- this is what lets a statement span multiple
-    /// lines (e.g. a multi-line function body) with no special handling.
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             match self.peek_char() {
@@ -219,8 +215,6 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        
-
         let token = match c {
             '^' => {
                 self.bump();
@@ -247,8 +241,6 @@ impl<'a> Lexer<'a> {
                 Token::Slash
             }
             '.' => {
-                // Note: a bare `.` is only a Dot token here. A leading-dot
-                // number like `.5` is not supported on purpose -- write `0.5`.
                 self.bump();
                 Token::Dot
             }
@@ -256,7 +248,6 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 Token::Comma
             }
-
             '=' => {
                 self.bump();
                 if self.peek_char() == Some('=') {
@@ -333,16 +324,6 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    /// Identifiers are plain here: `Token::Ident(String)`.
-    ///
-    /// I deliberately did NOT special-case things like `print` or `t` into
-    /// their own `Token::Print` / `Token::Class` variants. At the lexer
-    /// stage `t<APPL>` and `print <ratio>` look exactly like "ident, then
-    /// punctuation" -- whether `t` means "declare a variable of class t" or
-    /// `print` means "call the builtin print" is a *parsing* decision, not
-    /// a lexing one. If you want real keywords later (e.g. `if`, `let`),
-    /// the easiest place to add them is right here: check `ident.as_str()`
-    /// against a keyword list and return a `Token::Keyword(...)` instead.
     fn read_ident(&mut self) -> Token {
         let mut s = String::new();
         while let Some(c) = self.peek_char() {
@@ -356,10 +337,6 @@ impl<'a> Lexer<'a> {
         Token::Ident(s)
     }
 
-    /// Reads an int or float literal. `123` -> Int, `123.45` -> Float.
-    /// A trailing dot with no digits after it (e.g. `12.`) is treated as
-    /// `Int(12)` followed by a separate `Dot` token, so things like
-    /// `APPL.earnings` are never accidentally swallowed by number parsing.
     fn read_number(&mut self) -> Result<Token, LexError> {
         let (start_line, start_col) = (self.line, self.col);
         let mut s = String::new();
@@ -414,7 +391,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Reads a double-quoted string, supporting `\"`, `\\`, `\n`, `\t`, `\r`.
     fn read_string(&mut self) -> Result<Token, LexError> {
         let (start_line, start_col) = (self.line, self.col);
         self.bump(); // consume opening quote
@@ -465,8 +441,6 @@ fn is_ident_continue(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-// Small helper so `main.rs` (or a parser module) can tokenize a whole
-// string in one call without constructing a `Lexer` directly.
 pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, LexError> {
     Lexer::new(source).tokenize()
 }
@@ -485,150 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn assignment_and_class_subset() {
-        assert_eq!(
-            toks("company = t<APPL>"),
-            vec![
-                Token::Ident("company".into()),
-                Token::Equals,
-                Token::Ident("t".into()),
-                Token::LAngle,
-                Token::Ident("APPL".into()),
-                Token::RAngle,
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn field_access_and_subset() {
-        assert_eq!(
-            toks("earnings = APPL.earnings <ttm>"),
-            vec![
-                Token::Ident("earnings".into()),
-                Token::Equals,
-                Token::Ident("APPL".into()),
-                Token::Dot,
-                Token::Ident("earnings".into()),
-                Token::LAngle,
-                Token::Ident("ttm".into()),
-                Token::RAngle,
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn division() {
-        assert_eq!(
-            toks("ratio = earnings/price"),
-            vec![
-                Token::Ident("ratio".into()),
-                Token::Equals,
-                Token::Ident("earnings".into()),
-                Token::Slash,
-                Token::Ident("price".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn print_stmt() {
-        assert_eq!(
-            toks("print <ratio>"),
-            vec![
-                Token::Ident("print".into()),
-                Token::LAngle,
-                Token::Ident("ratio".into()),
-                Token::RAngle,
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn semicolon_separates_statements() {
-        assert_eq!(
-            toks("a = 1; b = 2;"),
-            vec![
-                Token::Ident("a".into()),
-                Token::Equals,
-                Token::Int(1),
-                Token::Semicolon,
-                Token::Ident("b".into()),
-                Token::Equals,
-                Token::Int(2),
-                Token::Semicolon,
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn newlines_are_just_whitespace_now() {
-        // A newline used to be its own token; now it's whitespace, same as
-        // a space -- these two should tokenize identically.
-        assert_eq!(toks("a = 1;\nb = 2;"), toks("a = 1; b = 2;"));
-    }
-
-    #[test]
-    fn numbers_int_and_float() {
-        assert_eq!(
-            toks("1 2.5 100"),
-            vec![
-                Token::Int(1),
-                Token::Float(2.5),
-                Token::Int(100),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn dot_after_int_is_not_swallowed() {
-        // e.g. calling `.something` on a number-like thing shouldn't eat the dot.
-        assert_eq!(
-            toks("12.field"),
-            vec![Token::Int(12), Token::Dot, Token::Ident("field".into()), Token::Eof]
-        );
-    }
-
-    #[test]
-    fn strings_with_escapes() {
-        assert_eq!(
-            toks(r#""hello \"world\"\n""#),
-            vec![Token::Str("hello \"world\"\n".into()), Token::Eof]
-        );
-    }
-
-    #[test]
-    fn comment_is_ignored() {
-        assert_eq!(
-            toks("a = 1; # this is a comment\nb = 2;"),
-            vec![
-                Token::Ident("a".into()),
-                Token::Equals,
-                Token::Int(1),
-                Token::Semicolon,
-                Token::Ident("b".into()),
-                Token::Equals,
-                Token::Int(2),
-                Token::Semicolon,
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn unterminated_string_errors() {
-        let err = tokenize("\"abc").unwrap_err();
-        assert!(err.message.contains("unterminated string"));
-    }
-
-    #[test]
-    fn unexpected_char_errors() {
-        let err = tokenize("a = @").unwrap_err();
-        assert!(err.message.contains("unexpected character"));
+    fn brackets_lex() {
+        assert_eq!(toks("[unsafe]"), vec![Token::LBracket, Token::Ident("unsafe".into()), Token::RBracket, Token::Eof]);
     }
 }

@@ -67,11 +67,6 @@ fn main() -> ExitCode {
     let mut interp = Interpreter::new("data", generator_script.clone());
     stdlib::register_all(&mut interp);
 
-    // Every ticker the program will ever touch is knowable up front --
-    // ticker names are static text, never computed at runtime (see
-    // `interpreter::collect_tickers`'s doc comment) -- so fetch them all
-    // concurrently now, instead of paying for each one sequentially,
-    // one at a time, as `run` happens to reach each `t<TICKER>`.
     let tickers = interpreter::collect_tickers(&program);
     if !tickers.is_empty() {
         eprintln!(
@@ -93,24 +88,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// How many generator subprocesses to run at once. Each one is mostly
-/// waiting on network I/O (or, for the stub generator, negligible local
-/// work), so this can comfortably be higher than the machine's core
-/// count -- it's bounded at all mainly to avoid firing off dozens of
-/// simultaneous requests against a real data provider (e.g. Yahoo
-/// Finance) on a script with a lot of tickers, which risks looking like
-/// abuse and getting rate-limited or blocked rather than actually being
-/// faster.
 const PREFETCH_CONCURRENCY: usize = 6;
 
-/// Runs the generator script for every ticker in `tickers`, up to
-/// `PREFETCH_CONCURRENCY` at a time, and returns the ones that
-/// succeeded. A ticker that fails to prefetch (bad symbol, network
-/// hiccup, whatever) is silently left out of the result -- it isn't
-/// reported as an error here, because `construct_ticker` will try again
-/// synchronously the moment the script actually evaluates that
-/// `t<TICKER>`, and *that's* the place a real, accurately-attributed
-/// error should surface, not this best-effort background pass.
 fn prefetch_tickers(
     tickers: &std::collections::HashSet<String>,
     generator_script: &Path,
@@ -126,9 +105,6 @@ fn prefetch_tickers(
     for ticker in tickers { tx.send(ticker.clone()).ok(); }
     drop(tx);
 
-    // A handful of worker threads pull from the same queue until it's
-    // empty -- simple bounded-concurrency without pulling in a thread
-    // pool crate for what's a handful of subprocesses at a time.
     let rx = std::sync::Mutex::new(rx);
     let worker_count = PREFETCH_CONCURRENCY.min(tickers.len().max(1));
 
@@ -164,12 +140,6 @@ fn prefetch_tickers(
     })
 }
 
-/// Locate scripts/generate_data.py. Checked, in order:
-/// 1. `FIN_GENERATOR_SCRIPT` env var, if set.
-/// 2. `scripts/generate_data.py` relative to the current directory
-///    (the normal case: running `fin` from the project root).
-/// 3. A couple of locations relative to the `fin` executable itself, so
-///    `cargo run` and a built binary both find it without extra setup.
 fn find_generator_script() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("FIN_GENERATOR_SCRIPT") {
         let p = PathBuf::from(p);

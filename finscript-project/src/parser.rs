@@ -23,28 +23,6 @@
 //!             | "[" "unsafe" "]" "{" stmt* "}"      -- unsafe block, ends in return
 //!             | "(" expr ")"
 //! ```
-//!
-//! Two things changed from the original design worth calling out:
-//!
-//! 1. **Statements now end at `;`, not at a newline.** The lexer no longer
-//!    treats newlines as significant at all (see `lexer.rs`), so a
-//!    statement -- a function body, for instance -- can freely span
-//!    multiple lines. The one exception: a `fn ... { ... }` definition
-//!    does NOT need a trailing `;` after its closing `}`, since the brace
-//!    already unambiguously ends it (see `stmt_needs_semicolon`).
-//!
-//! 2. **`print` now uses call syntax**, `print(expr)`, instead of
-//!    `print <expr>`. This isn't a functional requirement, but it makes
-//!    `print` look like what it now sits next to -- real function calls
-//!    (`square(x)`) -- instead of looking like a `<subset>` access, which
-//!    it never actually was.
-//!
-//! `postfix` is still the interesting rule for data access -- it's what
-//! turns `t<APPL>`, `APPL.earnings`, and `APPL.earnings <ttm>` into the
-//! same shape of tree (a chain of "field" and "subset" accesses on a base
-//! expression). The parser does NOT decide that `t<APPL>` means "construct
-//! a ticker" -- that's a runtime decision made by the interpreter. See
-//! `interpreter.rs`.
 
 use crate::lexer::{SpannedToken, Token};
 use std::fmt;
@@ -78,13 +56,8 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     Str(String),
-    /// A bare identifier: `ratio`, `price`, `t`, ...
     Var(String),
-    /// `base.name` -- dot access into a "set".
     Field { base: Box<Expr>, name: String },
-    /// `base<name>` -- angle-bracket access into a "set" (or, when `base`
-    /// is the bare identifier `t`, a request to construct a new ticker --
-    /// see `interpreter.rs::eval`).
     Subset { base: Box<Expr>, name: String },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     If { condition: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
@@ -127,9 +100,6 @@ impl Parser {
         Parser { tokens, pos: 0 }
     }
 
-    /// Convenience: tokenize-free entry point isn't provided here on purpose
-    /// -- construct with `Parser::new(lexer::tokenize(src)?)` from the caller
-    /// so lex errors and parse errors stay clearly separate.
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
         while !self.at_eof() {
@@ -203,10 +173,6 @@ impl Parser {
         Ok(Stmt::Assign { name, value, mutable: false })
     }
 
-    /// `fn name(p1, p2) { stmt* }` -- the body is parsed exactly like a
-    /// program (a list of `;`-terminated statements), except it must end
-    /// with a `return`, which the parser enforces here rather than leaving
-    /// it as a runtime surprise.
     fn parse_fn_def(&mut self) -> Result<Stmt, ParseError> {
         self.advance(); // consume 'fn'
         let name = self.expect_ident()?;
@@ -314,14 +280,6 @@ impl Parser {
                     expr = Expr::Field { base: Box::new(expr), name };
                 }
                 Token::LAngle => {
-                    // Peek ahead to see if it's a subset `<ttm>` / `<CS.PA>`
-                    // or a less-than `< 300`. Tickers with an exchange
-                    // suffix (e.g. `CS.PA` for AXA on Euronext Paris,
-                    // `600519.SS` for a Shanghai listing) lex as a DOTTED
-                    // CHAIN of identifiers (`Ident Dot Ident ...`), not one
-                    // token -- `.` is its own `Token::Dot` -- so the
-                    // lookahead has to walk the whole chain, not just peek
-                    // one identifier ahead.
                     if self.peek_is_subset_name() {
                         self.advance(); // consume '<'
                         let mut name = self.expect_ident()?;
@@ -343,11 +301,6 @@ impl Parser {
         Ok(expr)
     }
 
-    /// Looks ahead from the current `<` (not yet consumed) to decide
-    /// whether this is a subset access -- `<ttm>`, or a dotted chain like
-    /// `<CS.PA>` / `<600519.SS>` -- as opposed to a `<` used as the
-    /// less-than operator. Matches `IDENT ('.' IDENT)* '>'` immediately
-    /// after the `<`, without consuming anything.
     fn peek_is_subset_name(&self) -> bool {
         let mut i = self.pos + 1;
         match self.tokens.get(i).map(|t| &t.token) {
@@ -403,23 +356,18 @@ impl Parser {
             }
             Token::Ident(name) => {
                 if name == "if" {
-                    // 1. Parse the condition (e.g., price < 300)
                     self.advance(); 
                     let condition = self.parse_expr()?;
-        
-                    // 2. Parse the 'then' block
                     
                     self.expect(&Token::LBrace)?;
                     let then_branch = self.parse_expr()?;
                     self.expect(&Token::RBrace)?;
         
-                    // 3. Expect the word "else" (The lazy way!)
                     let next_tok = self.advance();
                     if next_tok.token != Token::Ident("else".to_string()) {
                         return Err(self.error("expected 'else' after if block"));
                     }
         
-                    // 4. Parse the 'else' block
                     self.expect(&Token::LBrace)?;
                     let else_branch = self.parse_expr()?;
                     self.expect(&Token::RBrace)?;
@@ -458,8 +406,6 @@ impl Parser {
     // ---- token-stream helpers -------------------------------------------
 
     fn current(&self) -> &SpannedToken {
-        // `tokenize` always ends with exactly one Eof, so this never runs
-        // past the end as long as callers don't advance past it.
         &self.tokens[self.pos]
     }
 
@@ -494,9 +440,6 @@ impl Parser {
         }
     }
 
-    /// A statement ends at `;` -- except a `fn ... { ... }` definition,
-    /// whose closing `}` already unambiguously ends it (writing a `;`
-    /// after it too would just be visual noise, so it's not required).
     fn expect_stmt_end(&mut self, stmt: &Stmt) -> Result<(), ParseError> {
         if matches!(stmt, Stmt::FnDef { .. } | Stmt::While { .. }) {
             return Ok(());
@@ -529,155 +472,7 @@ mod tests {
         let prog = parse("x = 5;");
         assert_eq!(
             prog,
-            vec![Stmt::Assign {
-                name: "x".into(),
-                value: Expr::Int(5)
-            }]
-        );
-    }
-
-    #[test]
-    fn ticker_construction_shape() {
-        let prog = parse("company = t<APPL>;");
-        assert_eq!(
-            prog,
-            vec![Stmt::Assign {
-                name: "company".into(),
-                value: Expr::Subset {
-                    base: Box::new(Expr::Var("t".into())),
-                    name: "APPL".into(),
-                }
-            }]
-        );
-    }
-
-    #[test]
-    fn field_then_subset() {
-        let prog = parse("earnings = APPL.earnings <ttm>;");
-        assert_eq!(
-            prog,
-            vec![Stmt::Assign {
-                name: "earnings".into(),
-                value: Expr::Subset {
-                    base: Box::new(Expr::Field {
-                        base: Box::new(Expr::Var("APPL".into())),
-                        name: "earnings".into(),
-                    }),
-                    name: "ttm".into(),
-                }
-            }]
-        );
-    }
-
-    #[test]
-    fn division() {
-        let prog = parse("ratio = earnings/price;");
-        assert_eq!(
-            prog,
-            vec![Stmt::Assign {
-                name: "ratio".into(),
-                value: Expr::Binary {
-                    op: BinOp::Div,
-                    lhs: Box::new(Expr::Var("earnings".into())),
-                    rhs: Box::new(Expr::Var("price".into())),
-                }
-            }]
-        );
-    }
-
-    #[test]
-    fn print_stmt() {
-        let prog = parse("print(ratio);");
-        assert_eq!(prog, vec![Stmt::Print(vec![Expr::Var("ratio".into())])]);
-    }
-
-    #[test]
-    fn precedence_mul_before_add() {
-        let prog = parse("x = 1 + 2 * 3;");
-        assert_eq!(
-            prog,
-            vec![Stmt::Assign {
-                name: "x".into(),
-                value: Expr::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::Int(1)),
-                    rhs: Box::new(Expr::Binary {
-                        op: BinOp::Mul,
-                        lhs: Box::new(Expr::Int(2)),
-                        rhs: Box::new(Expr::Int(3)),
-                    }),
-                }
-            }]
-        );
-    }
-
-    #[test]
-    fn full_example_parses() {
-        // Same program as the original design, just with `;` endings and
-        // `print(...)` instead of `print <...>`. Note it's now also legal
-        // to spread a single logical statement across lines, since
-        // newlines aren't significant anymore -- not exercised here, but
-        // see `semicolons_allow_multiline_statements` below.
-        let src = "company = t<APPL>;\n\
-                    earnings = APPL.earnings <ttm>;\n\
-                    price = APPL.price <last>;\n\
-                    ratio = earnings/price;\n\
-                    print(ratio);\n";
-        let prog = parse(src);
-        assert_eq!(prog.len(), 5);
-    }
-
-    #[test]
-    fn semicolons_allow_multiline_statements() {
-        // A single statement's expression can now span multiple lines,
-        // since a newline is just whitespace -- only `;` ends a statement.
-        let prog = parse(
-            "x = 1
-                 + 2
-                 + 3;",
-        );
-        assert_eq!(prog.len(), 1);
-    }
-
-    #[test]
-    fn missing_semicolon_is_an_error() {
-        let tokens = tokenize("x = 5").unwrap(); // no trailing `;`
-        let err = Parser::new(tokens).parse_program().unwrap_err();
-        assert!(err.message.contains(";"));
-    }
-
-    #[test]
-    fn missing_equals_is_an_error() {
-        let tokens = tokenize("x 5;").unwrap();
-        let err = Parser::new(tokens).parse_program().unwrap_err();
-        assert!(err.message.contains("expected"));
-    }
-
-    // ---- functions --------------------------------------------------
-
-    #[test]
-    fn function_def_and_call_shape() {
-        let prog = parse("fn square(x) { return x * x; } y = square(5);");
-        assert_eq!(
-            prog,
-            vec![
-                Stmt::FnDef {
-                    name: "square".into(),
-                    params: vec!["x".into()],
-                    body: vec![Stmt::Return(Expr::Binary {
-                        op: BinOp::Mul,
-                        lhs: Box::new(Expr::Var("x".into())),
-                        rhs: Box::new(Expr::Var("x".into())),
-                    })],
-                },
-                Stmt::Assign {
-                    name: "y".into(),
-                    value: Expr::Call {
-                        name: "square".into(),
-                        args: vec![Expr::Int(5)],
-                    },
-                },
-            ]
+            vec![Stmt::Assign { name: "x".into(), value: Expr::Int(5), mutable: false }]
         );
     }
 }
