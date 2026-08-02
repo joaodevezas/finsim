@@ -1,3 +1,4 @@
+mod dag;
 mod interpreter;
 mod lexer;
 mod parser;
@@ -6,6 +7,7 @@ mod stdlib;
 use interpreter::Interpreter;
 use lexer::tokenize;
 use parser::Parser;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
@@ -15,17 +17,20 @@ fn main() -> ExitCode {
     let mut args = std::env::args();
     let program_name = args.next().unwrap_or_else(|| "fin".to_string());
 
-    let path_arg = match args.next() {
+    let (path_arg, cli_params) = parse_cli_args(args);
+    let path_arg = match path_arg {
         Some(p) => p,
         None => {
-            eprintln!("usage: {program_name} <file.fi>");
+            eprintln!("usage: {program_name} <file.fi|file.fic> [--name=value ...]");
             return ExitCode::FAILURE;
         }
     };
 
     let path = Path::new(&path_arg);
-    if path.extension().and_then(|e| e.to_str()) != Some("fi") {
-        eprintln!("warning: '{path_arg}' does not have a .fi extension, reading it anyway");
+    let extension = path.extension().and_then(|e| e.to_str());
+    let is_dag_file = extension == Some("fic");
+    if extension != Some("fi") && !is_dag_file {
+        eprintln!("warning: '{path_arg}' does not have a .fi or .fic extension, reading it anyway");
     }
 
     let source = match std::fs::read_to_string(path) {
@@ -64,8 +69,23 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut interp = Interpreter::new("data", generator_script.clone());
+    let mut interp = Interpreter::new("data", generator_script.clone()).with_params(cli_params);
     stdlib::register_all(&mut interp);
+
+    // Every time an actual .fi program runs, also save its dependency
+    // DAG as a `.fic` file in the data folder, so it can be re-run later
+    // with different variable values via `finscript <name>.fic --x=5`,
+    // without touching the original code. (A `.fic` file re-running
+    // itself would just save an identical copy, so skip it in that case.)
+    if !is_dag_file {
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) => match interp.save_dag_file(&program, stem) {
+                Ok(dag_path) => eprintln!("saved DAG to '{}'", dag_path.display()),
+                Err(e) => eprintln!("warning: could not save DAG file: {e}"),
+            },
+            None => eprintln!("warning: could not determine a file stem for '{path_arg}'; DAG not saved"),
+        }
+    }
 
     let tickers = interpreter::collect_tickers(&program);
     if !tickers.is_empty() {
@@ -86,6 +106,40 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Split the remaining command-line arguments into (at most) one file
+/// path and a set of `--name=value` overrides, in any order, e.g.:
+///
+/// ```text
+/// finscript test.fic --x=5 --y=2
+/// finscript --x=5 test.fic --y=2
+/// ```
+///
+/// Variable names must match exactly what they're called in the source
+/// (e.g. `--x=5` fills in the slot left by `x = param();`).
+fn parse_cli_args(args: impl Iterator<Item = String>) -> (Option<String>, HashMap<String, String>) {
+    let mut path = None;
+    let mut params = HashMap::new();
+
+    for arg in args {
+        if let Some(rest) = arg.strip_prefix("--") {
+            match rest.split_once('=') {
+                Some((key, value)) => {
+                    params.insert(key.to_string(), value.to_string());
+                }
+                None => {
+                    eprintln!("warning: ignoring malformed argument '{arg}' (expected --name=value)");
+                }
+            }
+        } else if path.is_none() {
+            path = Some(arg);
+        } else {
+            eprintln!("warning: ignoring unexpected extra argument '{arg}'");
+        }
+    }
+
+    (path, params)
 }
 
 const PREFETCH_CONCURRENCY: usize = 6;

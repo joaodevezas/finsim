@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CLASS_T: &str = "t";
+pub(crate) const CLASS_T: &str = "t";
 
 #[derive(Debug, Clone)]
 struct FnDecl {
@@ -73,12 +73,26 @@ pub struct Interpreter {
     python_bin: String,
     prefetched: std::collections::HashSet<String>,
     in_unsafe: usize,
+    /// Raw `--name=value` overrides supplied on the command line, used to
+    /// fill in `param()` slots (see `resolve_param` and DAG files in
+    /// `dag.rs`). Keyed by variable name, exactly as written in the source.
+    params: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 enum Flow {
     Normal,
     Return(Value),
+}
+
+/// Parse a raw `--name=value` string (from the command line) into a
+/// `Value`: numbers parse as `Value::Number`, everything else is kept as
+/// a `Value::Str` verbatim (no quoting needed on the CLI).
+fn parse_param_value(raw: &str) -> Value {
+    match raw.parse::<f64>() {
+        Ok(n) => Value::Number(n),
+        Err(_) => Value::Str(raw.to_string()),
+    }
 }
 
 pub fn collect_tickers(program: &Program) -> std::collections::HashSet<String> {
@@ -154,7 +168,16 @@ impl Interpreter {
             python_bin: "python3".to_string(),
             prefetched: std::collections::HashSet::new(),
             in_unsafe: 0,
+            params: HashMap::new(),
         }
+    }
+
+    /// Supply `--name=value` overrides (as parsed from the command line)
+    /// to be used for any `param()` slots the program contains -- see the
+    /// DAG-file format in `dag.rs`.
+    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
+        self.params = params;
+        self
     }
 
     fn env_get(&self, name: &str) -> Option<&Binding> {
@@ -214,7 +237,20 @@ impl Interpreter {
     fn exec_stmt_flow(&mut self, stmt: &Stmt) -> Result<Flow, RuntimeError> {
         match stmt {
             Stmt::Assign { name, value, mutable } => {
-                let v = self.eval(value)?;      
+                // `name = param();` / `name = param(default);` is a
+                // pseudo-call: a DAG-file parameter slot, resolved
+                // against `--name=value` on the command line (or against
+                // the optional default expression) rather than evaluated
+                // like an ordinary function call. See `dag.rs`.
+                let v = if let Expr::Call { name: fname, args } = value {
+                    if fname.as_str() == "param" {
+                        self.resolve_param(name, args)?
+                    } else {
+                        self.eval(value)?
+                    }
+                } else {
+                    self.eval(value)?
+                };
 
                 if *mutable {
                     if self.in_unsafe == 0 {
@@ -391,6 +427,52 @@ impl Interpreter {
             Value::Number(n) => Ok(*n),
             other => Err(RuntimeError::new(format!("expected a number, found {other}"))),
         }
+    }
+
+    /// Resolve a `param()` slot for the top-level variable `var_name`.
+    ///
+    /// - If `--var_name=value` was supplied on the command line, use it
+    ///   (parsed as a number when possible, otherwise kept as a string).
+    /// - Otherwise, if `param(default)` was written with a default
+    ///   expression, evaluate and use that.
+    /// - Otherwise, this is a required parameter that wasn't supplied:
+    ///   error out with a message telling the user how to supply it.
+    fn resolve_param(&mut self, var_name: &str, args: &[Expr]) -> Result<Value, RuntimeError> {
+        if let Some(raw) = self.params.get(var_name).cloned() {
+            return Ok(parse_param_value(&raw));
+        }
+        match args.len() {
+            0 => Err(RuntimeError::new(format!(
+                "missing required parameter `{var_name}`; supply it with --{var_name}=<value>"
+            ))),
+            1 => self.eval(&args[0]),
+            n => Err(RuntimeError::new(format!(
+                "`param()` takes at most one argument (a default value), got {n}"
+            ))),
+        }
+    }
+
+    /// Build the dependency DAG for `program` and write it out as a
+    /// `.fic` DAG file in this interpreter's data directory, named after
+    /// `source_stem` (e.g. `"test"` -> `data/test.fic`). Returns the path
+    /// written to.
+    pub fn save_dag_file(
+        &self,
+        program: &Program,
+        source_stem: &str,
+    ) -> Result<PathBuf, RuntimeError> {
+        let dag = crate::dag::build_dag(program)
+            .map_err(|e| RuntimeError::new(format!("could not build DAG: {e}")))?;
+        let rendered = crate::dag::render_dag_file(program, &dag);
+
+        std::fs::create_dir_all(&self.data_dir)
+            .map_err(|e| RuntimeError::new(format!("could not create '{}': {e}", self.data_dir.display())))?;
+
+        let out_path = self.data_dir.join(format!("{source_stem}.fic"));
+        std::fs::write(&out_path, rendered)
+            .map_err(|e| RuntimeError::new(format!("could not write '{}': {e}", out_path.display())))?;
+
+        Ok(out_path)
     }
 
     fn call_function(&mut self, name: &str, args: &[Expr]) -> Result<Value, RuntimeError> {

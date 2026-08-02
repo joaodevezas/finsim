@@ -1,0 +1,12 @@
+# Auto-generated DAG file -- do not hand-edit unless you mean to.
+# Regenerate it by re-running the original .fi program.
+#
+# Parameters (all required; fill in with --name=value):
+#   --x (was: 5)
+#
+# Hardcoded ticker fetches (not parameterized -- these are baked in):
+#   target = t<AAPL>
+
+print("Hello world \n");
+target = t<AAPL>;
+x = param();  # was: x = 5;
