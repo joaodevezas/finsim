@@ -106,6 +106,84 @@ pub struct Interpreter {
     generator_script: PathBuf,
     /// Which python executable to invoke. `python3` on most systems.
     python_bin: String,
+    /// Tickers already fetched by a prefetch pass (see `collect_tickers`
+    /// + `main.rs`) *this run*, so `construct_ticker` knows it's safe to
+    /// skip shelling out again. Deliberately NOT the same thing as "does
+    /// the file exist on disk" -- a leftover file from a previous,
+    /// unrelated run would otherwise get reused silently forever with no
+    /// freshness check at all. Cross-run caching (with an actual TTL) is
+    /// a separate, not-yet-built feature; this only ever short-circuits
+    /// work this same process already did moments ago.
+    prefetched: std::collections::HashSet<String>,
+}
+
+/// Walks a parsed `Program` once and returns every distinct ticker name
+/// referenced anywhere via `t<TICKER>`, without running anything.
+///
+/// This is possible at all because ticker names are always static text in
+/// this language -- there's no string interpolation and no way to build a
+/// ticker name at runtime -- so the complete set of tickers a script will
+/// ever touch is knowable just from its AST. `main.rs` uses this to fetch
+/// everything concurrently *before* `Interpreter::run` starts, instead of
+/// discovering (and fetching) tickers one at a time as execution reaches
+/// each `t<TICKER>` expression.
+///
+/// Deliberately does NOT recurse into `FnDef` bodies: `check_purity`
+/// already guarantees a function body can never contain `t<...>` at all
+/// (see `check_expr_purity`'s `Subset` arm), so there's nothing to find
+/// in there -- skipping them is just avoiding pointless work, not
+/// missing anything.
+pub fn collect_tickers(program: &Program) -> std::collections::HashSet<String> {
+    let mut tickers = std::collections::HashSet::new();
+    for stmt in program {
+        collect_tickers_stmt(stmt, &mut tickers);
+    }
+    tickers
+}
+
+fn collect_tickers_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::Assign { value, .. } => collect_tickers_expr(value, out),
+        Stmt::Print(exprs) => {
+            for e in exprs {
+                collect_tickers_expr(e, out);
+            }
+        }
+        Stmt::Return(expr) => collect_tickers_expr(expr, out),
+        // A `fn` body is guaranteed ticker-free by `check_purity` at
+        // definition time -- nothing to collect inside one.
+        Stmt::FnDef { .. } => {}
+    }
+}
+
+fn collect_tickers_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Var(_) => {}
+        Expr::Field { base, .. } => collect_tickers_expr(base, out),
+        Expr::Subset { base, name } => {
+            if let Expr::Var(class_name) = base.as_ref() {
+                if class_name == CLASS_T {
+                    out.insert(name.clone());
+                    return;
+                }
+            }
+            collect_tickers_expr(base, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_tickers_expr(lhs, out);
+            collect_tickers_expr(rhs, out);
+        }
+        Expr::If { condition, then_branch, else_branch } => {
+            collect_tickers_expr(condition, out);
+            collect_tickers_expr(then_branch, out);
+            collect_tickers_expr(else_branch, out);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_tickers_expr(arg, out);
+            }
+        }
+    }
 }
 
 impl Interpreter {
@@ -117,6 +195,7 @@ impl Interpreter {
             data_dir: data_dir.into(),
             generator_script: generator_script.into(),
             python_bin: "python3".to_string(),
+            prefetched: std::collections::HashSet::new(),
         }
     }
 
@@ -126,6 +205,27 @@ impl Interpreter {
     pub fn with_python_bin(mut self, bin: impl Into<String>) -> Self {
         self.python_bin = bin.into();
         self
+    }
+
+    /// Records that `ticker`'s JSON was already fetched by a prefetch
+    /// pass this run, so `construct_ticker` can skip shelling out again
+    /// when `t<TICKER>` is actually evaluated. Call this once per
+    /// successfully-prefetched ticker, before `run`.
+    pub fn mark_prefetched(&mut self, ticker: impl Into<String>) {
+        self.prefetched.insert(ticker.into());
+    }
+
+    /// Where `t<TICKER>` writes/reads `<TICKER>.json`. Exposed so a
+    /// prefetch pass in `main.rs` can write into the exact same
+    /// directory `construct_ticker` will later look in.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The python executable `t<TICKER>` will invoke. Exposed for the
+    /// same reason as `data_dir`.
+    pub fn python_bin(&self) -> &str {
+        &self.python_bin
     }
 
     /// Registers a prewritten Rust function under `name`, so DSL source
@@ -458,26 +558,37 @@ impl Interpreter {
         std::fs::create_dir_all(&self.data_dir)
             .map_err(|e| RuntimeError::new(format!("could not create '{}': {e}", self.data_dir.display())))?;
 
-        let status = Command::new(&self.python_bin)
-            .arg(&self.generator_script)
-            .arg(ticker)
-            .arg(&self.data_dir)
-            .status()
-            .map_err(|e| {
-                RuntimeError::new(format!(
-                    "failed to run `{} {}`: {e} (is python3 installed and on PATH?)",
-                    self.python_bin,
-                    self.generator_script.display()
-                ))
-            })?;
+        let json_path = self.data_dir.join(format!("{ticker}.json"));
 
-        if !status.success() {
-            return Err(RuntimeError::new(format!(
-                "generator script exited with {status} for ticker `{ticker}`"
-            )));
+        // If a prefetch pass (see `collect_tickers` + `main.rs`) already
+        // fetched this ticker before the program started running, skip
+        // shelling out again -- but only trust `self.prefetched`, not
+        // "does the file exist," so a stale file left over from some
+        // earlier, unrelated run never gets silently reused. A prefetch
+        // failure for this ticker just falls through to the normal path
+        // below, so the script still gets a real, accurate error here if
+        // it still fails.
+        if !self.prefetched.contains(ticker) || !json_path.is_file() {
+            let status = Command::new(&self.python_bin)
+                .arg(&self.generator_script)
+                .arg(ticker)
+                .arg(&self.data_dir)
+                .status()
+                .map_err(|e| {
+                    RuntimeError::new(format!(
+                        "failed to run `{} {}`: {e} (is python3 installed and on PATH?)",
+                        self.python_bin,
+                        self.generator_script.display()
+                    ))
+                })?;
+
+            if !status.success() {
+                return Err(RuntimeError::new(format!(
+                    "generator script exited with {status} for ticker `{ticker}`"
+                )));
+            }
         }
 
-        let json_path = self.data_dir.join(format!("{ticker}.json"));
         let value = self.load_json(&json_path)?;
 
         // The ticker itself becomes a variable, independent of whatever

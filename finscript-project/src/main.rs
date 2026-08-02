@@ -7,7 +7,9 @@ use interpreter::Interpreter;
 use lexer::tokenize;
 use parser::Parser;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::sync::mpsc;
+use std::thread;
 
 fn main() -> ExitCode {
     let mut args = std::env::args();
@@ -62,14 +64,110 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut interp = Interpreter::new("data", generator_script);
+    let mut interp = Interpreter::new("data", generator_script.clone());
     stdlib::register_all(&mut interp);
+
+    // Every ticker the program will ever touch is knowable up front --
+    // ticker names are static text, never computed at runtime (see
+    // `interpreter::collect_tickers`'s doc comment) -- so fetch them all
+    // concurrently now, instead of paying for each one sequentially,
+    // one at a time, as `run` happens to reach each `t<TICKER>`.
+    let tickers = interpreter::collect_tickers(&program);
+    if !tickers.is_empty() {
+        eprintln!(
+            "prefetching {} ticker(s): {}",
+            tickers.len(),
+            tickers.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        let fetched = prefetch_tickers(&tickers, &generator_script, interp.data_dir(), interp.python_bin());
+        for ticker in fetched {
+            interp.mark_prefetched(ticker);
+        }
+    }
+
     if let Err(e) = interp.run(&program) {
         eprintln!("{path_arg}: {e}");
         return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS
+}
+
+/// How many generator subprocesses to run at once. Each one is mostly
+/// waiting on network I/O (or, for the stub generator, negligible local
+/// work), so this can comfortably be higher than the machine's core
+/// count -- it's bounded at all mainly to avoid firing off dozens of
+/// simultaneous requests against a real data provider (e.g. Yahoo
+/// Finance) on a script with a lot of tickers, which risks looking like
+/// abuse and getting rate-limited or blocked rather than actually being
+/// faster.
+const PREFETCH_CONCURRENCY: usize = 6;
+
+/// Runs the generator script for every ticker in `tickers`, up to
+/// `PREFETCH_CONCURRENCY` at a time, and returns the ones that
+/// succeeded. A ticker that fails to prefetch (bad symbol, network
+/// hiccup, whatever) is silently left out of the result -- it isn't
+/// reported as an error here, because `construct_ticker` will try again
+/// synchronously the moment the script actually evaluates that
+/// `t<TICKER>`, and *that's* the place a real, accurately-attributed
+/// error should surface, not this best-effort background pass.
+fn prefetch_tickers(
+    tickers: &std::collections::HashSet<String>,
+    generator_script: &Path,
+    data_dir: &Path,
+    python_bin: &str,
+) -> Vec<String> {
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        eprintln!("warning: could not create '{}': {e} (prefetch skipped, will fetch during run instead)", data_dir.display());
+        return Vec::new();
+    }
+
+    let (tx, rx) = mpsc::channel::<String>(); // work queue: ticker names to fetch
+    for ticker in tickers {
+        tx.send(ticker.clone()).ok();
+    }
+    drop(tx);
+
+    // A handful of worker threads pull from the same queue until it's
+    // empty -- simple bounded-concurrency without pulling in a thread
+    // pool crate for what's a handful of subprocesses at a time.
+    let rx = std::sync::Mutex::new(rx);
+    let worker_count = PREFETCH_CONCURRENCY.min(tickers.len().max(1));
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let rx = &rx;
+            handles.push(scope.spawn(move || {
+                let mut succeeded = Vec::new();
+                loop {
+                    let ticker = {
+                        let rx = rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    let Ok(ticker) = ticker else { break };
+
+                    let status = Command::new(python_bin)
+                        .arg(generator_script)
+                        .arg(&ticker)
+                        .arg(data_dir)
+                        .status();
+
+                    match status {
+                        Ok(s) if s.success() => succeeded.push(ticker),
+                        Ok(s) => eprintln!(
+                            "warning: prefetch of `{ticker}` exited with {s}, will retry during run"
+                        ),
+                        Err(e) => eprintln!(
+                            "warning: could not prefetch `{ticker}`: {e}, will retry during run"
+                        ),
+                    }
+                }
+                succeeded
+            }));
+        }
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
 }
 
 /// Locate scripts/generate_data.py. Checked, in order:
