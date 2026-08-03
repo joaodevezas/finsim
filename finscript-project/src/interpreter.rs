@@ -452,27 +452,38 @@ impl Interpreter {
         }
     }
 
-    /// Build the dependency DAG for `program` and write it out as a
-    /// `.fic` DAG file in this interpreter's data directory, named after
-    /// `source_stem` (e.g. `"test"` -> `data/test.fic`). Returns the path
-    /// written to.
+    /// Build the dependency DAG for `program` and write it out as both a
+    /// `.fic` DAG file and a `.dot` Graphviz file, in this interpreter's
+    /// data directory, named after `source_stem` (e.g. `"test"` ->
+    /// `data/test.fic` + `data/test.dot`). Returns (fic_path, dot_path).
+    ///
+    /// The `.dot` file isn't runnable by anything in this crate -- it's
+    /// for visualizing the graph with an external Graphviz renderer, e.g.:
+    ///   `dot -Tpng data/test.dot -o data/test.png`
+    /// or by pasting its contents into an online viewer such as
+    /// https://dreampuf.github.io/GraphvizOnline/.
     pub fn save_dag_file(
         &self,
         program: &Program,
         source_stem: &str,
-    ) -> Result<PathBuf, RuntimeError> {
+    ) -> Result<(PathBuf, PathBuf), RuntimeError> {
         let dag = crate::dag::build_dag(program)
             .map_err(|e| RuntimeError::new(format!("could not build DAG: {e}")))?;
         let rendered = crate::dag::render_dag_file(program, &dag);
+        let dot = dag.to_dot();
 
         std::fs::create_dir_all(&self.data_dir)
             .map_err(|e| RuntimeError::new(format!("could not create '{}': {e}", self.data_dir.display())))?;
 
-        let out_path = self.data_dir.join(format!("{source_stem}.fic"));
-        std::fs::write(&out_path, rendered)
-            .map_err(|e| RuntimeError::new(format!("could not write '{}': {e}", out_path.display())))?;
+        let fic_path = self.data_dir.join(format!("{source_stem}.fic"));
+        std::fs::write(&fic_path, rendered)
+            .map_err(|e| RuntimeError::new(format!("could not write '{}': {e}", fic_path.display())))?;
 
-        Ok(out_path)
+        let dot_path = self.data_dir.join(format!("{source_stem}.dot"));
+        std::fs::write(&dot_path, dot)
+            .map_err(|e| RuntimeError::new(format!("could not write '{}': {e}", dot_path.display())))?;
+
+        Ok((fic_path, dot_path))
     }
 
     fn call_function(&mut self, name: &str, args: &[Expr]) -> Result<Value, RuntimeError> {

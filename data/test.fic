@@ -1,12 +1,29 @@
 # Auto-generated DAG file -- do not hand-edit unless you mean to.
 # Regenerate it by re-running the original .fi program.
 #
-# Parameters (all required; fill in with --name=value):
-#   --x (was: 5)
-#
 # Hardcoded ticker fetches (not parameterized -- these are baked in):
 #   target = t<AAPL>
+#
+# Live nodes (still run their original code every time):
+#   earnings -- reads a ticker fetch (was: target.earnings<ttm>)
+#   pe -- calls a function (not traced) (was: pe_ratio(mcap, earnings))
+#   mcap -- calls a function (not traced) (was: market_cap(shares, price))
+#   shares -- reads a ticker fetch (was: target.shares<last>)
+#   price -- reads a ticker fetch (was: target.price<last>)
 
-print("Hello world \n");
+print("Calculating Apple's PE ratio \n");
 target = t<AAPL>;
-x = param();  # was: x = 5;
+shares = target.shares<last>;
+price = target.price<last>;
+earnings = target.earnings<ttm>;
+fn market_cap(shares, price) {
+    mcap = shares * price;
+    return mcap;
+}
+fn pe_ratio(mcap, earnings) {
+    pe = mcap / earnings;
+    return pe;
+}
+mcap = market_cap(shares, price);
+pe = pe_ratio(mcap, earnings);
+print("The PE ratio is ", pe, "\n");

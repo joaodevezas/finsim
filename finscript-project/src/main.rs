@@ -80,7 +80,9 @@ fn main() -> ExitCode {
     if !is_dag_file {
         match path.file_stem().and_then(|s| s.to_str()) {
             Some(stem) => match interp.save_dag_file(&program, stem) {
-                Ok(dag_path) => eprintln!("saved DAG to '{}'", dag_path.display()),
+                Ok((fic_path, dot_path)) => {
+                    eprintln!("saved DAG to '{}' (graph: '{}')", fic_path.display(), dot_path.display());
+                }
                 Err(e) => eprintln!("warning: could not save DAG file: {e}"),
             },
             None => eprintln!("warning: could not determine a file stem for '{path_arg}'; DAG not saved"),

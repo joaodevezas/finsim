@@ -1,3 +1,21 @@
-print("Hello world \n");
+print("Calculating Apple's PE ratio \n");
 target = t<AAPL>;
-x = 5;
+
+shares = target.shares <last>;
+price = target.price <last>;
+earnings = target.earnings <ttm>;
+
+fn market_cap(shares, price){
+    mcap = shares * price;
+    return mcap;
+}
+
+fn pe_ratio(mcap, earnings){
+    pe = mcap/earnings;
+    return pe;
+}
+
+mcap = market_cap(shares, price);
+pe = pe_ratio(mcap, earnings);
+
+print("The PE ratio is ", pe, "\n");

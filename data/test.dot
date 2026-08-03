@@ -1,0 +1,16 @@
+digraph fin_dag {
+  rankdir=LR;
+  n0 [label="target (t<AAPL>)" shape=box style=filled fillcolor=gold];
+  n1 [label="shares (live: reads a ticker fetch)" shape=ellipse style=filled fillcolor=lightpink];
+  n2 [label="price (live: reads a ticker fetch)" shape=ellipse style=filled fillcolor=lightpink];
+  n3 [label="earnings (live: reads a ticker fetch)" shape=ellipse style=filled fillcolor=lightpink];
+  n4 [label="mcap (live: calls a function (not traced))" shape=ellipse style=filled fillcolor=lightpink];
+  n5 [label="pe (live: calls a function (not traced))" shape=ellipse style=filled fillcolor=lightpink];
+  n0 -> n1;
+  n0 -> n2;
+  n0 -> n3;
+  n1 -> n4;
+  n2 -> n4;
+  n4 -> n5;
+  n3 -> n5;
+}
